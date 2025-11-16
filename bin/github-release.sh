@@ -1,65 +1,100 @@
 #!/bin/bash
 
+set -e
+
 CONFIG="/etc/sys-backup-v3/config.yml"
 ENVFILE="/etc/sys-backup-v3/.env"
 VERSIONFILE="/opt/sys-backup-v3/version"
 
-# ENV Variablen laden
 source "$ENVFILE"
 
+GH_USER=$(grep username: "$CONFIG" | awk '{print $2}' | tr -d '"')
+GH_REPO=$(grep repository: "$CONFIG" | awk '{print $2}' | tr -d '"')
+
 if [[ -z "$GITHUB_TOKEN" ]]; then
-    echo "FEHLER: Kein GitHub Token gefunden!"
+    echo "❌ FEHLER: Kein GitHub Token!"
     exit 1
 fi
 
-# GitHub Daten aus config.yml lesen
-GH_USER=$(grep 'username:' "$CONFIG" | awk '{print $2}' | tr -d '"')
-GH_REPO=$(grep 'repository:' "$CONFIG" | awk '{print $2}' | tr -d '"')
+VERSION=$(grep VERSION= "$VERSIONFILE" | cut -d'"' -f2)
+TAG="v$VERSION"
 
-if [[ -z "$GH_USER" || -z "$GH_REPO" ]]; then
-    echo "FEHLER: GitHub-Daten fehlen in config.yml!"
+echo "--------------------------------------------------------"
+echo " AUTO-RELEASE"
+echo "--------------------------------------------------------"
+echo "Version: $VERSION"
+echo "Tag:     $TAG"
+echo ""
+
+# Release erstellen
+echo "📦 Erstelle Release..."
+RELEASE_RESPONSE=$(curl -s -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -d "{\"tag_name\":\"$TAG\",\"name\":\"Release $VERSION\"}" \
+    https://api.github.com/repos/$GH_USER/$GH_REPO/releases)
+
+UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r .upload_url | sed 's/{?name,label}//')
+
+if [[ "$UPLOAD_URL" == "null" ]]; then
+    echo "⚠️ Release schon vorhanden – Version wird erhöht"
+    sys-backup bump alpha
     exit 1
 fi
 
-# Version auslesen
-VERSION=$(grep 'VERSION=' "$VERSIONFILE" | cut -d'"' -f2)
-DATE=$(date +%Y-%m-%d)
-
-# Release-Paket erstellen
 TMP="/tmp/sys-backup-v3-release"
 rm -rf "$TMP"
-mkdir "$TMP"
+mkdir -p "$TMP"
 
-cp -r /opt/sys-backup-v3 "$TMP/"
+ZIP="$TMP/sys-backup-$VERSION.zip"
 
-cd "$TMP"
-tar -czf sys-backup-v3-$VERSION.tar.gz sys-backup-v3/
-cd -
+echo "📦 Erstelle ZIP..."
+cd /opt
+zip -qr "$ZIP" sys-backup-v3/
 
-# API Upload
-echo "Erstelle GitHub Release $VERSION ..."
-API_JSON=$(printf '{"tag_name": "%s","name": "Release %s","body": "Automatisches Release am %s"}' "$VERSION" "$VERSION" "$DATE")
+ZIP_SIZE=$(stat -c%s "$ZIP")
 
-RELEASE_RESPONSE=$(curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$API_JSON" \
-  https://api.github.com/repos/$GH_USER/$GH_REPO/releases)
-
-UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | grep upload_url | cut -d'"' -f4 | sed 's/{?name,label}//')
-
-if [[ -z "$UPLOAD_URL" ]]; then
-    echo "FEHLER: Release konnte nicht erstellt werden!"
-    echo "$RELEASE_RESPONSE"
+if [[ "$ZIP_SIZE" -lt 5000 ]]; then
+    echo "❌ FEHLER: ZIP ist beschädigt (nur $ZIP_SIZE bytes)"
     exit 1
 fi
 
-# Datei hochladen
-echo "Lade Release-Datei hoch ..."
-curl -s --data-binary @"$TMP/sys-backup-v3-$VERSION.tar.gz" \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Content-Type: application/gzip" \
-  "$UPLOAD_URL?name=sys-backup-v3-$VERSION.tar.gz"
+echo "✔ ZIP OK ($ZIP_SIZE bytes)"
 
-echo "GitHub Release erfolgreich erzeugt!"
+# SHA erzeugen
+SHA_FILE="$ZIP.sha256"
+sha256sum "$ZIP" | awk '{print $1}' > "$SHA_FILE"
 
+echo "🠉 Lade ZIP hoch..."
+ASSET_RESPONSE=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/zip" \
+    --data-binary @"$ZIP" \
+    "$UPLOAD_URL?name=$(basename $ZIP)")
+
+if echo "$ASSET_RESPONSE" | grep -q '"errors"'; then
+    echo "❌ FEHLER beim Hochladen der ZIP!"
+    echo "$ASSET_RESPONSE"
+    exit 1
+fi
+
+echo "✔ ZIP erfolgreich hochgeladen"
+
+echo "🠉 Lade SHA256 hoch..."
+SHA_RESPONSE=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: text/plain" \
+    --data-binary @"$SHA_FILE" \
+    "$UPLOAD_URL?name=$(basename $SHA_FILE)")
+
+if echo "$SHA_RESPONSE" | grep -q '"errors"'; then
+    echo "❌ FEHLER beim Hochladen der SHA!"
+    echo "$SHA_RESPONSE"
+    exit 1
+fi
+
+echo ""
+echo "--------------------------------------------------------"
+echo " 🎉 Release erfolgreich!"
+echo " ZIP:    $(basename "$ZIP")"
+echo " SHA256: $(basename "$SHA_FILE")"
+echo "--------------------------------------------------------"
