@@ -78,7 +78,7 @@ JSON_PAYLOAD=$(jq -n \
   '{ tag_name: $tag, name: $name, body: $body }')
 
 RESPONSE=$(curl -s \
-  -H "Authorization: token '"$GITHUB_TOKEN"'" \
+  -H "Authorization: token $GITHUB_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$JSON_PAYLOAD" \
   https://api.github.com/repos/$GH_USER/$GH_REPO/releases)
